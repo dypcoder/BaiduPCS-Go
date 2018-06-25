@@ -10,6 +10,7 @@ import (
 	"net/http/cookiejar"
 	"strconv"
 	"strings"
+	"unsafe"
 )
 
 func handleRespClose(resp *http.Response) error {
@@ -93,7 +94,7 @@ func (pcs *BaiduPCS) PrepareFilesDirectoriesBatchMeta(paths ...string) (dataRead
 }
 
 // PrepareFilesDirectoriesList 获取目录下的文件和目录列表, 只返回服务器响应数据和错误信息
-func (pcs *BaiduPCS) PrepareFilesDirectoriesList(path string) (dataReadCloser io.ReadCloser, pcsError Error) {
+func (pcs *BaiduPCS) PrepareFilesDirectoriesList(path string, options *OrderOptions) (dataReadCloser io.ReadCloser, pcsError Error) {
 	pcs.lazyInit()
 	if path == "" {
 		path = "/"
@@ -101,8 +102,8 @@ func (pcs *BaiduPCS) PrepareFilesDirectoriesList(path string) (dataReadCloser io
 
 	pcsURL := pcs.generatePCSURL("file", "list", map[string]string{
 		"path":  path,
-		"by":    "name",
-		"order": "asc", // 升序
+		"by":    *(*string)(unsafe.Pointer(&options.By)),
+		"order": *(*string)(unsafe.Pointer(&options.Order)),
 		"limit": "0-2147483647",
 	})
 	baiduPCSVerbose.Infof("%s URL: %s\n", OperationFilesDirectoriesList, pcsURL)
@@ -252,6 +253,30 @@ func (pcs *BaiduPCS) PrepareRapidUpload(targetPath, contentMD5, sliceMD5, crc32 
 		handleRespClose(resp)
 		return nil, &ErrInfo{
 			operation: OperationRapidUpload,
+			errType:   ErrTypeNetError,
+			err:       err,
+		}
+	}
+
+	return resp.Body, nil
+}
+
+// PrepareLocateDownload 提取下载链接, 只返回服务器响应数据和错误信息
+func (pcs *BaiduPCS) PrepareLocateDownload(pcspath string) (dataReadCloser io.ReadCloser, pcsError Error) {
+	pcs.lazyInit()
+	pcsURL := pcs.generatePCSURL("file", "locatedownload", map[string]string{
+		"path":         pcspath,
+		"ver":          "2",
+		"vip":          "1",
+		"network_type": "wifi",
+	})
+	baiduPCSVerbose.Infof("%s URL: %s\n", OperationLocateDownload, pcsURL)
+
+	resp, err := pcs.client.Req("POST", pcsURL.String(), nil, nil)
+	if err != nil {
+		handleRespClose(resp)
+		return nil, &ErrInfo{
+			operation: OperationLocateDownload,
 			errType:   ErrTypeNetError,
 			err:       err,
 		}

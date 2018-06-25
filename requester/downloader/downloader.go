@@ -5,10 +5,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/iikira/BaiduPCS-Go/pcsutil/waitgroup"
 	"github.com/iikira/BaiduPCS-Go/pcsverbose"
 	"github.com/iikira/BaiduPCS-Go/requester"
-	"github.com/iikira/BaiduPCS-Go/requester/rio"
 	"io"
+	"net/http"
 	"sync"
 	"time"
 )
@@ -29,7 +30,9 @@ type Downloader struct {
 	executeTime   time.Time
 	executed      bool
 	durl          string
-	writer        rio.WriteCloserAt
+	loadBalansers []string
+	tryHTTP       bool
+	writer        io.WriterAt
 	client        *requester.HTTPClient
 	config        *Config
 	monitor       *Monitor
@@ -37,7 +40,7 @@ type Downloader struct {
 }
 
 //NewDownloader 初始化Downloader
-func NewDownloader(durl string, writer rio.WriteCloserAt, config *Config) (der *Downloader) {
+func NewDownloader(durl string, writer io.WriterAt, config *Config) (der *Downloader) {
 	der = &Downloader{
 		durl:   durl,
 		config: config,
@@ -49,6 +52,11 @@ func NewDownloader(durl string, writer rio.WriteCloserAt, config *Config) (der *
 //SetClient 设置http客户端
 func (der *Downloader) SetClient(client *requester.HTTPClient) {
 	der.client = client
+}
+
+//TryHTTP 尝试使用 http 连接
+func (der *Downloader) TryHTTP(t bool) {
+	der.tryHTTP = t
 }
 
 func (der *Downloader) lazyInit() {
@@ -83,8 +91,12 @@ func (der *Downloader) Execute() error {
 		return errors.New(resp.Status)
 	}
 
+	if resp.ContentLength == 0 {
+		return errors.New("Content-Length is zero")
+	}
+
 	acceptRanges := resp.Header.Get("Accept-Ranges")
-	if resp.ContentLength <= 0 {
+	if resp.ContentLength < 0 {
 		acceptRanges = ""
 	} else {
 		acceptRanges = "bytes"
@@ -94,15 +106,62 @@ func (der *Downloader) Execute() error {
 	status.totalSize = resp.ContentLength
 
 	var (
-		req           = resp.Request
-		durl, referer string
+		loadBalancerResponses = make([]*LoadBalancerResponse, 0, len(der.loadBalansers)+1)
+		handleLoadBalancer    = func(req *http.Request) {
+			if req != nil {
+				if der.tryHTTP {
+					req.URL.Scheme = "http"
+				}
+
+				loadBalancer := &LoadBalancerResponse{
+					URL:     req.URL.String(),
+					Referer: req.Referer(),
+				}
+
+				loadBalancerResponses = append(loadBalancerResponses, loadBalancer)
+				pcsverbose.Verbosef("DEBUG: download task: URL: %s, Referer: %s\n", loadBalancer.URL, loadBalancer.Referer)
+			}
+		}
 	)
 
-	if req != nil {
-		referer = req.Referer()
-		durl = req.URL.String()
-		pcsverbose.Verbosef("DEBUG: download task: URL: %s, Referer: %s\n", durl, referer)
+	handleLoadBalancer(resp.Request)
+
+	// 负载均衡
+	wg := waitgroup.NewWaitGroup(10)
+	privTimeout := der.client.Client.Timeout
+	der.client.SetTimeout(5 * time.Second)
+	for _, loadBalanser := range der.loadBalansers {
+		wg.AddDelta()
+		go func(loadBalanser string) {
+			defer wg.Done()
+
+			subResp, subErr := der.client.Req("HEAD", loadBalanser, nil, nil)
+			if subResp != nil {
+				defer subResp.Body.Close()
+			}
+			if subErr != nil {
+				pcsverbose.Verbosef("DEBUG: loadBalanser Error: %s\n", subErr)
+				return
+			}
+
+			if !ServerEqual(resp, subResp) {
+				pcsverbose.Verbosef("DEBUG: loadBalanser not equal to main server: %s\n", subErr)
+				return
+			}
+
+			if subResp.Request != nil {
+				loadBalancerResponses = append(loadBalancerResponses, &LoadBalancerResponse{
+					URL: subResp.Request.URL.String(),
+				})
+			}
+			handleLoadBalancer(subResp.Request)
+
+		}(loadBalanser)
 	}
+	wg.Wait()
+	der.client.SetTimeout(privTimeout)
+
+	loadBalancerResponseList := NewLoadBalancerResponseList(loadBalancerResponses)
 
 	//load breakpoint
 	err = der.initInstanceState()
@@ -137,6 +196,10 @@ func (der *Downloader) Execute() error {
 		}
 	}
 
+	if der.config.parallel <= 0 {
+		der.config.parallel = 1
+	}
+
 	der.config.cacheSize = der.config.CacheSize
 	blockSize := status.totalSize / int64(der.config.parallel)
 
@@ -161,16 +224,17 @@ func (der *Downloader) Execute() error {
 		writerAt = der.writer
 	}
 
-	workerInit := func(wer *Worker) {
-		wer.SetClient(der.client)
-		wer.SetCacheSize(der.config.cacheSize)
-		wer.SetWriteMutex(writeMu)
-		wer.SetReferer(referer)
-	}
-
 	for i := 0; i < der.config.parallel; i++ {
-		worker := NewWorker(int32(i), durl, writerAt)
-		workerInit(worker)
+		loadBalancer := loadBalancerResponseList.SequentialGet()
+		if loadBalancer == nil {
+			continue
+		}
+
+		worker := NewWorker(i, loadBalancer.URL, writerAt)
+		worker.SetClient(der.client)
+		worker.SetCacheSize(der.config.cacheSize)
+		worker.SetWriteMutex(writeMu)
+		worker.SetReferer(loadBalancer.Referer)
 
 		// 分配线程
 		if isRange {

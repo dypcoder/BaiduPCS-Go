@@ -2,8 +2,11 @@
 package baidupcs
 
 import (
+	"errors"
 	"github.com/iikira/BaiduPCS-Go/pcsverbose"
 	"github.com/iikira/BaiduPCS-Go/requester"
+	"github.com/iikira/baidu-tools/pan"
+	"github.com/json-iterator/go"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
@@ -11,6 +14,8 @@ import (
 )
 
 const (
+	// OperationGetUK 获取UK
+	OperationGetUK = "获取UK"
 	// OperationQuotaInfo 获取当前用户空间配额信息
 	OperationQuotaInfo = "获取当前用户空间配额信息"
 	// OperationFilesDirectoriesMeta 获取文件/目录的元信息
@@ -39,6 +44,8 @@ const (
 	OperationDownloadFile = "下载单个文件"
 	// OperationDownloadStreamFile 下载流式文件
 	OperationDownloadStreamFile = "下载流式文件"
+	// OperationLocateDownload 提取下载链接
+	OperationLocateDownload = "提取下载链接"
 	// OperationCloudDlAddTask 添加离线下载任务
 	OperationCloudDlAddTask = "添加离线下载任务"
 	// OperationCloudDlQueryTask 精确查询离线下载任务
@@ -49,6 +56,12 @@ const (
 	OperationCloudDlCancelTask = "取消离线下载任务"
 	// OperationCloudDlDeleteTask 删除离线下载任务
 	OperationCloudDlDeleteTask = "删除离线下载任务"
+	// OperationShareSet 创建分享链接
+	OperationShareSet = "创建分享链接"
+	// OperationShareCancel 取消分享
+	OperationShareCancel = "取消分享"
+	// OperationShareList 列出分享列表
+	OperationShareList = "列出分享列表"
 )
 
 var (
@@ -101,6 +114,21 @@ func NewPCSWithClient(appID int, client *requester.HTTPClient) *BaiduPCS {
 	return pcs
 }
 
+// NewPCSWithCookieStr 提供app_id, cookie 字符串, 返回 BaiduPCS 对象
+func NewPCSWithCookieStr(appID int, cookieStr string) *BaiduPCS {
+	pcs := &BaiduPCS{
+		appID:  appID,
+		client: requester.NewHTTPClient(),
+	}
+
+	cookies := requester.ParseCookieStr(cookieStr)
+	jar, _ := cookiejar.New(nil)
+	jar.SetCookies(pcs.URL(), cookies)
+	pcs.client.SetCookiejar(jar)
+
+	return pcs
+}
+
 func (pcs *BaiduPCS) lazyInit() {
 	if pcs.client == nil {
 		pcs.client = requester.NewHTTPClient()
@@ -122,16 +150,17 @@ func (pcs *BaiduPCS) SetHTTPS(https bool) {
 	pcs.isHTTPS = https
 }
 
-func (pcs *BaiduPCS) generatePCSURL(subPath, method string, param ...map[string]string) *url.URL {
-	pcsURL := &url.URL{
-		Scheme: "http",
+// URL 返回 url
+func (pcs *BaiduPCS) URL() *url.URL {
+	return &url.URL{
+		Scheme: GetHTTPScheme(pcs.isHTTPS),
 		Host:   "pcs.baidu.com",
-		Path:   "/rest/2.0/pcs/" + subPath,
 	}
+}
 
-	if pcs.isHTTPS {
-		pcsURL.Scheme = "https"
-	}
+func (pcs *BaiduPCS) generatePCSURL(subPath, method string, param ...map[string]string) *url.URL {
+	pcsURL := pcs.URL()
+	pcsURL.Path = "/rest/2.0/pcs/" + subPath
 
 	uv := pcsURL.Query()
 	uv.Set("app_id", strconv.Itoa(pcs.appID))
@@ -148,13 +177,9 @@ func (pcs *BaiduPCS) generatePCSURL(subPath, method string, param ...map[string]
 
 func (pcs *BaiduPCS) generatePCSURL2(subPath, method string, param ...map[string]string) *url.URL {
 	pcsURL2 := &url.URL{
-		Scheme: "http",
+		Scheme: GetHTTPScheme(pcs.isHTTPS),
 		Host:   "pan.baidu.com",
 		Path:   "/rest/2.0/" + subPath,
-	}
-
-	if pcs.isHTTPS {
-		pcsURL2.Scheme = "https"
 	}
 
 	uv := pcsURL2.Query()
@@ -168,4 +193,49 @@ func (pcs *BaiduPCS) generatePCSURL2(subPath, method string, param ...map[string
 
 	pcsURL2.RawQuery = uv.Encode()
 	return pcsURL2
+}
+
+// UK 获取用户 UK
+func (pcs *BaiduPCS) UK() (uk int64, pcsError Error) {
+	pcs.lazyInit()
+
+	pcsURL := GetHTTPScheme(pcs.isHTTPS) + "://pan.baidu.com/api/user/getinfo?need_selfinfo=1"
+
+	errInfo := NewErrorInfo(OperationGetUK)
+	body, err := pcs.client.Fetch("GET", pcsURL, nil, map[string]string{
+		"User-Agent": "netdisk;8.3.1",
+	})
+	if err != nil {
+		errInfo.errType = ErrTypeNetError
+		errInfo.err = err
+		return 0, errInfo
+	}
+
+	jsonData := struct {
+		pan.RemoteErrInfo
+		Records []struct {
+			Uk int64 `json:"uk"`
+		} `json:"records"`
+	}{}
+
+	err = jsoniter.Unmarshal(body, &jsonData)
+	if err != nil {
+		errInfo.jsonError(err)
+		return 0, errInfo
+	}
+
+	if jsonData.ErrNo != 0 {
+		jsonData.RemoteErrInfo.ParseErrMsg()
+		errInfo.ErrCode = jsonData.RemoteErrInfo.ErrNo
+		errInfo.ErrMsg = jsonData.RemoteErrInfo.ErrMsg
+		return 0, errInfo
+	}
+
+	if len(jsonData.Records) != 1 {
+		errInfo.errType = ErrTypeOthers
+		errInfo.err = errors.New("Unknown remote data")
+		return 0, errInfo
+	}
+
+	return jsonData.Records[0].Uk, nil
 }

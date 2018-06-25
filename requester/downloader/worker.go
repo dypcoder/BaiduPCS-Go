@@ -20,7 +20,7 @@ type Worker struct {
 	speedsPerSecond int64 //速度
 	wrange          Range
 	speedsStat      speeds.Speeds
-	id              int32  //id
+	id              int    //id
 	cacheSize       int    //下载缓存
 	url             string //下载地址
 	referer         string //来源地址
@@ -41,7 +41,7 @@ type Worker struct {
 }
 
 //NewWorker 初始化Worker
-func NewWorker(id int32, durl string, writerAt io.WriterAt) *Worker {
+func NewWorker(id int, durl string, writerAt io.WriterAt) *Worker {
 	return &Worker{
 		id:       id,
 		url:      durl,
@@ -50,7 +50,7 @@ func NewWorker(id int32, durl string, writerAt io.WriterAt) *Worker {
 }
 
 //ID 返回worker ID
-func (wer *Worker) ID() int32 {
+func (wer *Worker) ID() int {
 	return wer.id
 }
 
@@ -233,7 +233,10 @@ func (wer *Worker) Execute() {
 	}
 
 	// 已完成
-	if wer.wrange.Len() == 0 {
+	if rlen := wer.wrange.Len(); rlen <= 0 {
+		if rlen < 0 {
+			pcsverbose.Verbosef("DEBUG: RangeLen is negative at begin: %v, %d\n", wer.wrange, wer.wrange.Len())
+		}
 		wer.status.statusCode = StatusCodeSuccessed
 		return
 	}
@@ -255,7 +258,6 @@ func (wer *Worker) Execute() {
 	wer.status.statusCode = StatusCodePending
 
 	var resp *http.Response
-
 	resp, wer.err = wer.client.Req("GET", wer.url, nil, header)
 	if resp != nil {
 		defer resp.Body.Close()
@@ -334,7 +336,8 @@ func (wer *Worker) Execute() {
 			// 初始化数据
 			var readErr error
 			n = 0
-			// 线程未被分配
+
+			// 读取数据
 			for n < len(buf) && readErr == nil && (single || wer.wrange.Len() > 0) {
 				nn, readErr = resp.Body.Read(buf[n:])
 				nn64 = int64(nn)
@@ -394,15 +397,20 @@ func (wer *Worker) Execute() {
 			}
 
 			if readErr != nil {
+				rlen := wer.wrange.Len()
 				switch {
 				case single && readErr == io.ErrUnexpectedEOF:
 					// 单线程判断下载成功
 					fallthrough
 				case readErr == io.EOF:
 					fallthrough
-				case wer.wrange.Len() == 0:
+				case rlen <= 0:
 					// 下载完成
+					// 小于0可能是因为 worker 被 duplicate
 					wer.status.statusCode = StatusCodeSuccessed
+					if rlen < 0 {
+						pcsverbose.Verbosef("DEBUG: RangeLen is negative at end: %v, %d\n", wer.wrange, wer.wrange.Len())
+					}
 					return
 				default:
 					// 其他错误, 返回

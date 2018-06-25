@@ -3,8 +3,10 @@ package main
 import (
 	"encoding/hex"
 	"fmt"
+	"github.com/iikira/BaiduPCS-Go/baidupcs"
 	"github.com/iikira/BaiduPCS-Go/internal/pcscommand"
 	"github.com/iikira/BaiduPCS-Go/internal/pcsconfig"
+	"github.com/iikira/BaiduPCS-Go/internal/pcsupdate"
 	"github.com/iikira/BaiduPCS-Go/internal/pcsweb"
 	"github.com/iikira/BaiduPCS-Go/pcscache"
 	_ "github.com/iikira/BaiduPCS-Go/pcsinit"
@@ -28,11 +30,12 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 var (
 	// Version 版本号
-	Version = "v3.5"
+	Version = "v3.5.3-devel"
 
 	historyFilePath = filepath.Join(pcsconfig.GetConfigDir(), "pcs_command_history.txt")
 	reloadFn        = func(c *cli.Context) error {
@@ -63,6 +66,8 @@ var (
 	GZIP <disable-gzip>:
 		在文件加密之前, 启用GZIP压缩文件; 文件解密之后启用GZIP解压缩文件, 默认启用,
 		如果不启用, 则无法检测文件是否解密成功, 解密文件时会保留源文件, 避免解密失败造成文件数据丢失.`
+
+	isCli bool
 )
 
 func init() {
@@ -79,6 +84,7 @@ func init() {
 	}
 
 	// 启动缓存回收
+	pcscache.DirCache.SetLifeTime(10 * time.Second)
 	pcscache.DirCache.GC()
 	requester.TCPAddrCache.GC()
 }
@@ -106,8 +112,7 @@ func main() {
 
 	交流反馈:
 		提交Issue: https://github.com/iikira/BaiduPCS-Go/issues
-		邮箱: i@mail.iikira.com
-		QQ群: 178324706`
+		邮箱: i@mail.iikira.com`
 
 	app.Flags = []cli.Flag{
 		cli.BoolFlag{
@@ -122,7 +127,8 @@ func main() {
 			fmt.Printf("未找到命令: %s\n运行命令 %s help 获取帮助\n", c.Args().Get(0), app.Name)
 			return
 		}
-		cli.ShowAppHelp(c)
+
+		isCli = true
 		pcsverbose.Verbosef("VERBOSE: 这是一条调试信息\n\n")
 
 		var (
@@ -147,7 +153,7 @@ func main() {
 				lineArgs                   = args.GetArgs(line)
 				numArgs                    = len(lineArgs)
 				acceptCompleteFileCommands = []string{
-					"cd", "cp", "download", "export", "ls", "meta", "mkdir", "mv", "rapidupload", "rm", "tree", "upload",
+					"cd", "cp", "download", "export", "locate", "ls", "meta", "mkdir", "mv", "rapidupload", "rm", "share", "tree", "upload",
 				}
 				closed = strings.LastIndex(line, " ") == len(line)-1
 			)
@@ -219,7 +225,7 @@ func main() {
 			filesPtr := pcscache.DirCache.Get(targetDir)
 
 			if filesPtr == nil {
-				files, err := pcs.FilesDirectoriesList(targetDir)
+				files, err := pcs.FilesDirectoriesList(targetDir, baidupcs.DefaultOrderOptions)
 				if err != nil {
 					return
 				}
@@ -267,6 +273,10 @@ func main() {
 
 			return
 		})
+
+		fmt.Printf("提示: 方向键上下可切换历史命令.\n")
+		fmt.Printf("提示: Ctrl + A / E 跳转命令 首 / 尾.\n")
+		fmt.Printf("提示: 输入 help 获取帮助.\n")
 
 		for {
 			var (
@@ -372,6 +382,26 @@ func main() {
 				}
 
 				return nil
+			},
+		},
+		{
+			Name:     "update",
+			Usage:    "检测程序更新",
+			Category: "其他",
+			Action: func(c *cli.Context) error {
+				if c.IsSet("y") {
+					if !c.Bool("y") {
+						return nil
+					}
+				}
+				pcsupdate.CheckUpdate(app.Version, c.Bool("y"))
+				return nil
+			},
+			Flags: []cli.Flag{
+				cli.BoolFlag{
+					Name:  "y",
+					Usage: "确认更新",
+				},
 			},
 		},
 		{
@@ -557,15 +587,24 @@ func main() {
 		{
 			Name:        "loglist",
 			Usage:       "列出帐号列表",
-			Description: "获取当前帐号, 和所有已登录的百度帐号",
+			Description: "列出所有已登录的百度帐号",
+			Category:    "百度帐号",
+			Before:      reloadFn,
+			Action: func(c *cli.Context) error {
+				list := pcsconfig.Config.BaiduUserList()
+				fmt.Println(list.String())
+				return nil
+			},
+		},
+		{
+			Name:        "who",
+			Usage:       "获取当前帐号",
+			Description: "获取当前帐号的信息",
 			Category:    "百度帐号",
 			Before:      reloadFn,
 			Action: func(c *cli.Context) error {
 				activeUser := pcsconfig.Config.ActiveUser()
-				fmt.Printf("\n当前帐号 uid: %d, 用户名: %s\n\n", activeUser.UID, activeUser.Name)
-
-				list := pcsconfig.Config.BaiduUserList()
-				fmt.Println(list.String())
+				fmt.Printf("当前帐号 uid: %d, 用户名: %s, 性别: %s, 年龄: %.1f\n", activeUser.UID, activeUser.Name, activeUser.Sex, activeUser.Age)
 				return nil
 			},
 		},
@@ -633,20 +672,76 @@ func main() {
 
 	示例:
 
-	相对路径:
+	列出 我的资源 内的文件和目录
 	BaiduPCS-Go ls 我的资源
 
-	绝对路径:
+	绝对路径
 	BaiduPCS-Go ls /我的资源
 
-	使用通配符:
+	降序排序
+	BaiduPCS-Go ls -desc 我的资源
+
+	按文件大小降序排序
+	BaiduPCS-Go ls -size -desc 我的资源
+
+	使用通配符
 	BaiduPCS-Go ls /我的*
 `,
 			Category: "百度网盘",
 			Before:   reloadFn,
 			Action: func(c *cli.Context) error {
-				pcscommand.RunLs(c.Args().Get(0))
+				orderOptions := &baidupcs.OrderOptions{}
+				switch {
+				case c.IsSet("asc"):
+					orderOptions.Order = baidupcs.OrderAsc
+				case c.IsSet("desc"):
+					orderOptions.Order = baidupcs.OrderDesc
+				default:
+					orderOptions.Order = baidupcs.OrderAsc
+				}
+
+				switch {
+				case c.IsSet("time"):
+					orderOptions.By = baidupcs.OrderByTime
+				case c.IsSet("name"):
+					orderOptions.By = baidupcs.OrderByName
+				case c.IsSet("size"):
+					orderOptions.By = baidupcs.OrderBySize
+				default:
+					orderOptions.By = baidupcs.OrderByName
+				}
+
+				pcscommand.RunLs(c.Args().Get(0), &pcscommand.LsOptions{
+					Total: c.Bool("l") || c.Parent().Args().Get(0) == "ll",
+				}, orderOptions)
+
 				return nil
+			},
+			Flags: []cli.Flag{
+				cli.BoolFlag{
+					Name:  "l",
+					Usage: "详细显示",
+				},
+				cli.BoolFlag{
+					Name:  "asc",
+					Usage: "升序排序",
+				},
+				cli.BoolFlag{
+					Name:  "desc",
+					Usage: "降序排序",
+				},
+				cli.BoolFlag{
+					Name:  "time",
+					Usage: "根据时间排序",
+				},
+				cli.BoolFlag{
+					Name:  "name",
+					Usage: "根据文件名排序",
+				},
+				cli.BoolFlag{
+					Name:  "size",
+					Usage: "根据大小排序",
+				},
 			},
 		},
 		{
@@ -831,7 +926,9 @@ func main() {
 					return nil
 				}
 
-				var saveTo string
+				var (
+					saveTo string
+				)
 
 				if c.Bool("save") {
 					saveTo = "."
@@ -839,14 +936,25 @@ func main() {
 					saveTo = filepath.Clean(c.String("saveto"))
 				}
 
-				pcscommand.RunDownload(c.Args(), pcscommand.DownloadOption{
+				do := &pcscommand.DownloadOptions{
 					IsTest:               c.Bool("test"),
 					IsPrintStatus:        c.Bool("status"),
 					IsExecutedPermission: c.Bool("x") && runtime.GOOS != "windows",
 					IsOverwrite:          c.Bool("ow"),
+					IsShareDownload:      c.Bool("share"),
+					IsLocateDownload:     c.Bool("locate"),
+					IsStreaming:          c.Bool("stream"),
 					SaveTo:               saveTo,
 					Parallel:             c.Int("p"),
-				})
+					Load:                 c.Int("l"),
+				}
+
+				if c.Bool("bg") && isCli {
+					pcscommand.RunBgDownload(c.Args(), do)
+				} else {
+					pcscommand.RunDownload(c.Args(), do)
+				}
+
 				return nil
 			},
 			Flags: []cli.Flag{
@@ -874,9 +982,58 @@ func main() {
 					Name:  "x",
 					Usage: "为文件加上执行权限, (windows系统无效)",
 				},
+				cli.BoolFlag{
+					Name:  "stream",
+					Usage: "以流式文件的方式下载",
+				},
+				cli.BoolFlag{
+					Name:  "share",
+					Usage: "以分享文件的方式获取下载链接来下载",
+				},
+				cli.BoolFlag{
+					Name:  "locate",
+					Usage: "以获取直链的方式来下载",
+				},
 				cli.IntFlag{
 					Name:  "p",
 					Usage: "指定下载线程数",
+				},
+				cli.IntFlag{
+					Name:  "l",
+					Usage: "指定同时进行下载文件的数量",
+				},
+				cli.BoolFlag{
+					Name:  "bg",
+					Usage: "加入后台下载",
+				},
+			},
+		},
+		{
+			Name:  "bg",
+			Usage: "管理后台任务",
+			Description: `
+	默认关闭下载中任何向终端的输出
+	再后台进行文件下载，不会影响用户继续在客户端操作
+	可以同时进行多个任务
+
+	示例:
+
+	显示所有后台任务
+	BaiduPCS-Go bg
+`,
+			Category: "其他",
+			Before:   reloadFn,
+			Action: func(c *cli.Context) error {
+				if c.NArg() == 0 {
+					pcscommand.BgMap.PrintAllBgTask()
+					return nil
+				}
+				return nil
+			},
+			Flags: []cli.Flag{
+				cli.BoolFlag{
+					Name:  "test",
+					Usage: "测试下载, 此操作不会保存文件到本地",
 				},
 			},
 		},
@@ -916,6 +1073,23 @@ func main() {
 				subArgs := c.Args()
 
 				pcscommand.RunUpload(subArgs[:c.NArg()-1], subArgs[c.NArg()-1])
+				return nil
+			},
+		},
+		{
+			Name:      "locate",
+			Aliases:   []string{"lt"},
+			Usage:     "获取下载直链",
+			UsageText: fmt.Sprintf("%s locate <文件1> <文件2> ...", app.Name),
+			Category:  "百度网盘",
+			Before:    reloadFn,
+			Action: func(c *cli.Context) error {
+				if c.NArg() < 1 {
+					cli.ShowCommandHelp(c, c.Command.Name)
+					return nil
+				}
+
+				pcscommand.RunLocateDownload(c.Args()...)
 				return nil
 			},
 		},
@@ -1022,7 +1196,7 @@ func main() {
 				}
 
 				for k, filePath := range c.Args() {
-					lp, err := pcscommand.GetFileSum(filePath, &pcscommand.SumOption{
+					lp, err := pcscommand.GetFileSum(filePath, &pcscommand.SumConfig{
 						IsMD5Sum:      true,
 						IsCRC32Sum:    true,
 						IsSliceMD5Sum: true,
@@ -1052,6 +1226,62 @@ func main() {
 				}
 
 				return nil
+			},
+		},
+		{
+			Name:      "share",
+			Usage:     "分享文件/目录",
+			UsageText: app.Name + " share",
+			Category:  "百度网盘",
+			Before:    reloadFn,
+			Action: func(c *cli.Context) error {
+				if c.NArg() < 2 {
+					cli.ShowCommandHelp(c, c.Command.Name)
+					return nil
+				}
+				return nil
+			},
+			Subcommands: []cli.Command{
+				{
+					Name:        "set",
+					Aliases:     []string{"s"},
+					Usage:       "设置分享文件/目录",
+					UsageText:   app.Name + " share set <文件/目录1> <文件/目录2> ...",
+					Description: `目前只支持创建私密链接.`,
+					Action: func(c *cli.Context) error {
+						if c.NArg() < 1 {
+							cli.ShowCommandHelp(c, c.Command.Name)
+							return nil
+						}
+						pcscommand.RunShareSet(c.Args(), nil)
+						return nil
+					},
+				},
+				{
+					Name:      "list",
+					Aliases:   []string{"l"},
+					Usage:     "列出已分享文件/目录",
+					UsageText: app.Name + " share list",
+					Action: func(c *cli.Context) error {
+						pcscommand.RunShareList()
+						return nil
+					},
+				},
+				{
+					Name:        "cancel",
+					Aliases:     []string{"c"},
+					Usage:       "取消分享文件/目录",
+					UsageText:   app.Name + " share cancel <shareid_1> <shareid_2> ...",
+					Description: `目前只支持通过分享id (shareid) 来取消分享.`,
+					Action: func(c *cli.Context) error {
+						if c.NArg() < 1 {
+							cli.ShowCommandHelp(c, c.Command.Name)
+							return nil
+						}
+						pcscommand.RunShareCancel(converter.SliceStringToInt64(c.Args()))
+						return nil
+					},
+				},
 			},
 		},
 		{
@@ -1262,6 +1492,9 @@ func main() {
 						if c.IsSet("max_parallel") {
 							pcsconfig.Config.SetMaxParallel(c.Int("max_parallel"))
 						}
+						if c.IsSet("max_download_load") {
+							pcsconfig.Config.SetMaxDownloadLoad(c.Int("max_download_load"))
+						}
 						if c.IsSet("savedir") {
 							pcsconfig.Config.SetSaveDir(c.String("savedir"))
 						}
@@ -1297,6 +1530,10 @@ func main() {
 						cli.IntFlag{
 							Name:  "max_parallel",
 							Usage: "下载最大并发量",
+						},
+						cli.IntFlag{
+							Name:  "max_download_load",
+							Usage: "同时进行下载文件的最大数量",
 						},
 						cli.StringFlag{
 							Name:  "savedir",

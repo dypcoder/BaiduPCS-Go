@@ -10,61 +10,90 @@ import (
 	"github.com/olekukonko/tablewriter"
 	"strconv"
 	"strings"
+	"unsafe"
 )
 
-// HandleFileDirectoryFunc 处理文件或目录的元信息
-type HandleFileDirectoryFunc func(depth int, fd *FileDirectory)
+type (
+	// OrderBy 排序字段
+	OrderBy string
+	// Order 升序降序
+	Order string
+)
 
-// FileDirectory 文件或目录的元信息
-type FileDirectory struct {
-	FsID        int64  // fs_id
-	Path        string // 路径
-	Filename    string // 文件名 或 目录名
-	Ctime       int64  // 创建日期
-	Mtime       int64  // 修改日期
-	MD5         string // md5 值
-	Size        int64  // 文件大小 (目录为0)
-	Isdir       bool   // 是否为目录
-	Ifhassubdir bool   // 是否含有子目录 (只对目录有效)
+const (
+	// OrderByName 根据文件名排序
+	OrderByName OrderBy = "name"
+	// OrderByTime 根据时间排序
+	OrderByTime OrderBy = "time"
+	// OrderBySize 根据大小排序, 注意目录无大小
+	OrderBySize OrderBy = "size"
+	// OrderAsc 升序
+	OrderAsc Order = "asc"
+	// OrderDesc 降序
+	OrderDesc Order = "desc"
+)
 
-	Parent   *FileDirectory    // 父目录信息
-	Children FileDirectoryList // 子目录信息
-}
+type (
+	// HandleFileDirectoryFunc 处理文件或目录的元信息
+	HandleFileDirectoryFunc func(depth int, fd *FileDirectory)
 
-// FileDirectoryList FileDirectory 的 指针数组
-type FileDirectoryList []*FileDirectory
+	// FileDirectory 文件或目录的元信息
+	FileDirectory struct {
+		FsID        int64  // fs_id
+		Path        string // 路径
+		Filename    string // 文件名 或 目录名
+		Ctime       int64  // 创建日期
+		Mtime       int64  // 修改日期
+		MD5         string // md5 值
+		Size        int64  // 文件大小 (目录为0)
+		Isdir       bool   // 是否为目录
+		Ifhassubdir bool   // 是否含有子目录 (只对目录有效)
 
-// fdJSON 用于解析远程JSON数据
-type fdJSON struct {
-	FsID           int64  `json:"fs_id"`           // fs_id
-	Path           string `json:"path"`            // 路径
-	Filename       string `json:"server_filename"` // 文件名 或 目录名
-	Ctime          int64  `json:"ctime"`           // 创建日期
-	Mtime          int64  `json:"mtime"`           // 修改日期
-	MD5            string `json:"md5"`             // md5 值
-	Size           int64  `json:"size"`            // 文件大小 (目录为0)
-	IsdirInt       int    `json:"isdir"`
-	IfhassubdirInt int    `json:"ifhassubdir"`
-}
-
-// convert 将解析的远程JSON数据, 转换为 *FileDirectory
-func (fj *fdJSON) convert() *FileDirectory {
-	return &FileDirectory{
-		FsID:        fj.FsID,
-		Path:        fj.Path,
-		Filename:    fj.Filename,
-		Ctime:       fj.Ctime,
-		Mtime:       fj.Mtime,
-		MD5:         fj.MD5,
-		Size:        fj.Size,
-		Isdir:       converter.IntToBool(fj.IsdirInt),
-		Ifhassubdir: converter.IntToBool(fj.IfhassubdirInt),
+		Parent   *FileDirectory    // 父目录信息
+		Children FileDirectoryList // 子目录信息
 	}
-}
 
-type fdData struct {
-	*ErrInfo
-	List []*fdJSON `json:"list"`
+	// FileDirectoryList FileDirectory 的 指针数组
+	FileDirectoryList []*FileDirectory
+
+	// fdJSON 用于解析远程JSON数据
+	fdJSON struct {
+		FsID           int64  `json:"fs_id"`           // fs_id
+		Path           string `json:"path"`            // 路径
+		Filename       string `json:"server_filename"` // 文件名 或 目录名
+		Ctime          int64  `json:"ctime"`           // 创建日期
+		Mtime          int64  `json:"mtime"`           // 修改日期
+		MD5            string `json:"md5"`             // md5 值
+		Size           int64  `json:"size"`            // 文件大小 (目录为0)
+		IsdirInt       int8   `json:"isdir"`
+		IfhassubdirInt int8   `json:"ifhassubdir"`
+
+		// 对齐
+		_ *fdJSON
+		_ []*fdJSON
+	}
+
+	fdData struct {
+		*ErrInfo
+		List []*FileDirectory
+	}
+
+	fdDataJSONExport struct {
+		*ErrInfo
+		List []*fdJSON `json:"list"`
+	}
+
+	// OrderOptions 列文件/目录可选项
+	OrderOptions struct {
+		By    OrderBy
+		Order Order
+	}
+)
+
+// DefaultOrderOptions 默认的排序
+var DefaultOrderOptions = &OrderOptions{
+	By:    OrderByName,
+	Order: OrderAsc,
 }
 
 // FilesDirectoriesMeta 获取单个文件/目录的元信息
@@ -106,7 +135,7 @@ func (pcs *BaiduPCS) FilesDirectoriesBatchMeta(paths ...string) (data FileDirect
 	}
 
 	d := jsoniter.NewDecoder(dataReadCloser)
-	err := d.Decode(jsonData)
+	err := d.Decode((*fdDataJSONExport)(unsafe.Pointer(jsonData)))
 	if err != nil {
 		errInfo.jsonError(err)
 		return nil, errInfo
@@ -119,17 +148,14 @@ func (pcs *BaiduPCS) FilesDirectoriesBatchMeta(paths ...string) (data FileDirect
 	}
 
 	// 结果处理
-	data = make(FileDirectoryList, len(jsonData.List))
-	for k := range jsonData.List {
-		data[k] = jsonData.List[k].convert()
-	}
+	data = jsonData.List
 
 	return
 }
 
 // FilesDirectoriesList 获取目录下的文件和目录列表
-func (pcs *BaiduPCS) FilesDirectoriesList(path string) (data FileDirectoryList, pcsError Error) {
-	dataReadCloser, pcsError := pcs.PrepareFilesDirectoriesList(path)
+func (pcs *BaiduPCS) FilesDirectoriesList(path string, options *OrderOptions) (data FileDirectoryList, pcsError Error) {
+	dataReadCloser, pcsError := pcs.PrepareFilesDirectoriesList(path, options)
 	if pcsError != nil {
 		return nil, pcsError
 	}
@@ -141,7 +167,7 @@ func (pcs *BaiduPCS) FilesDirectoriesList(path string) (data FileDirectoryList, 
 	}
 
 	d := jsoniter.NewDecoder(dataReadCloser)
-	err := d.Decode(jsonData)
+	err := d.Decode((*fdDataJSONExport)(unsafe.Pointer(jsonData)))
 	if err != nil {
 		jsonData.ErrInfo.jsonError(err)
 		return nil, jsonData.ErrInfo
@@ -168,15 +194,12 @@ func (pcs *BaiduPCS) FilesDirectoriesList(path string) (data FileDirectoryList, 
 		return FileDirectoryList{fd}, nil
 	}
 
-	data = make(FileDirectoryList, len(jsonData.List))
-	for k := range jsonData.List {
-		data[k] = jsonData.List[k].convert()
-	}
+	data = jsonData.List
 	return
 }
 
-func (pcs *BaiduPCS) recurseList(path string, depth int, handleFileDirectoryFunc HandleFileDirectoryFunc) (data FileDirectoryList, pcsError Error) {
-	fdl, pcsError := pcs.FilesDirectoriesList(path)
+func (pcs *BaiduPCS) recurseList(path string, depth int, options *OrderOptions, handleFileDirectoryFunc HandleFileDirectoryFunc) (data FileDirectoryList, pcsError Error) {
+	fdl, pcsError := pcs.FilesDirectoriesList(path, options)
 	if pcsError != nil {
 		return nil, pcsError
 	}
@@ -187,7 +210,7 @@ func (pcs *BaiduPCS) recurseList(path string, depth int, handleFileDirectoryFunc
 			continue
 		}
 
-		fdl[k].Children, pcsError = pcs.recurseList(fdl[k].Path, depth+1, handleFileDirectoryFunc)
+		fdl[k].Children, pcsError = pcs.recurseList(fdl[k].Path, depth+1, options, handleFileDirectoryFunc)
 		if pcsError != nil {
 			pcsverbose.Verboseln(pcsError)
 		}
@@ -197,8 +220,8 @@ func (pcs *BaiduPCS) recurseList(path string, depth int, handleFileDirectoryFunc
 }
 
 // FilesDirectoriesRecurseList 递归获取目录下的文件和目录列表
-func (pcs *BaiduPCS) FilesDirectoriesRecurseList(path string, handleFileDirectoryFunc HandleFileDirectoryFunc) (data FileDirectoryList, pcsError Error) {
-	return pcs.recurseList(path, 0, handleFileDirectoryFunc)
+func (pcs *BaiduPCS) FilesDirectoriesRecurseList(path string, options *OrderOptions, handleFileDirectoryFunc HandleFileDirectoryFunc) (data FileDirectoryList, pcsError Error) {
+	return pcs.recurseList(path, 0, options, handleFileDirectoryFunc)
 }
 
 func (f *FileDirectory) String() string {
